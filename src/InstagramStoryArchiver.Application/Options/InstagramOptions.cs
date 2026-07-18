@@ -33,7 +33,7 @@ public sealed class InstagramOptions
     [Range(1, 1024)]
     public int MaximumDownloadSizeMb { get; set; } = 100;
 
-    [Range(0, 15)]
+    [Range(0, 600)]
     public int SuccessJitterSeconds { get; set; } = 90;
 
     [Range(1, 30)]

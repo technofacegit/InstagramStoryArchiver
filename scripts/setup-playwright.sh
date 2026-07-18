@@ -8,22 +8,32 @@ echo "Restoring and building..."
 dotnet restore
 dotnet build -c Debug
 
-PLAYWRIGHT_PS1="src/InstagramStoryArchiver.Infrastructure/bin/Debug/net8.0/playwright.ps1"
-if [[ -f "$PLAYWRIGHT_PS1" ]]; then
-  echo "Installing Chromium via Playwright script..."
-  if command -v pwsh >/dev/null 2>&1; then
-    pwsh "$PLAYWRIGHT_PS1" install chromium
-  else
-    echo "pwsh not found. Trying Microsoft.Playwright.CLI..."
-    dotnet tool install --global Microsoft.Playwright.CLI || true
-    export PATH="$PATH:$HOME/.dotnet/tools"
-    playwright install chromium
-  fi
-else
-  echo "playwright.ps1 not found after build. Install CLI manually:"
-  echo "  dotnet tool install --global Microsoft.Playwright.CLI && playwright install chromium"
+PACKAGE_DIR="$HOME/.nuget/packages/microsoft.playwright"
+VERSION="$(ls -1 "$PACKAGE_DIR" 2>/dev/null | sort -V | tail -1 || true)"
+if [[ -z "${VERSION}" ]]; then
+  echo "Microsoft.Playwright package not found under $PACKAGE_DIR"
   exit 1
 fi
+
+ARCH="$(uname -m)"
+case "$(uname -s)-${ARCH}" in
+  Darwin-arm64) NODE_DIR="darwin-arm64" ;;
+  Darwin-*) NODE_DIR="darwin-x64" ;;
+  Linux-aarch64|Linux-arm64) NODE_DIR="linux-arm64" ;;
+  Linux-*) NODE_DIR="linux-x64" ;;
+  *) echo "Unsupported platform"; exit 1 ;;
+esac
+
+NODE="${PACKAGE_DIR}/${VERSION}/.playwright/node/${NODE_DIR}/node"
+CLI="${PACKAGE_DIR}/${VERSION}/.playwright/package/cli.js"
+
+if [[ ! -x "$NODE" || ! -f "$CLI" ]]; then
+  echo "Playwright driver not found at $NODE"
+  exit 1
+fi
+
+echo "Installing Chromium via Playwright driver..."
+"$NODE" "$CLI" install chromium
 
 mkdir -p data archive logs data/tmp
 echo "Setup complete."
