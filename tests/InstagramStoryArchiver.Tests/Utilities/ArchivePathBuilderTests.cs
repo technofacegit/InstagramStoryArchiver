@@ -11,7 +11,7 @@ public class ArchivePathBuilderTests
         var published = new DateTimeOffset(2026, 7, 18, 18, 45, 30, TimeSpan.Zero);
         var path = ArchivePathBuilder.BuildRelativePath("ExampleUser", published, "ABC123", ".mp4");
 
-        Assert.Equal(Path.Combine("exampleuser", "2026", "07", "18", "184530_ABC123.mp4"), path);
+        Assert.Equal(Path.Combine("exampleuser", "2026", "07", "18", "exampleuser_184530_ABC123.mp4"), path);
     }
 
     [Fact]

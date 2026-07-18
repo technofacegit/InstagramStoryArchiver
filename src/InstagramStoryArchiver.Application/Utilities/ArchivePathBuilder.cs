@@ -17,7 +17,7 @@ public static class ArchivePathBuilder
         var safeExtension = extension.StartsWith('.') ? extension[1..] : extension;
         safeExtension = SanitizeFileName(safeExtension);
 
-        var fileName = $"{publishedAt:HHmmss}_{safeKey}.{safeExtension}";
+        var fileName = $"{safeUsername}_{publishedAt:HHmmss}_{safeKey}.{safeExtension}";
         return Path.Combine(
             safeUsername,
             publishedAt.Year.ToString("D4"),

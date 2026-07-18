@@ -132,13 +132,13 @@ Migration’lar uygulama başlangıcında uygulanır.
 ## 12. Arşiv klasörü yapısı
 
 ```text
-archive/{username}/{yyyy}/{MM}/{dd}/{HHmmss}_{storyKey}.{ext}
+archive/{username}/{yyyy}/{MM}/{dd}/{username}_{HHmmss}_{storyKey}.{ext}
 ```
 
 Örnek:
 
 ```text
-archive/exampleuser/2026/07/18/184530_ABC123.mp4
+archive/exampleuser/2026/07/18/exampleuser_184530_ABC123.mp4
 ```
 
 İndirme önce `.tmp` dosyasına yapılır, başarıdan sonra atomik taşınır.
