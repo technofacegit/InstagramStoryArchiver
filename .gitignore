@@ -25,3 +25,12 @@ Thumbs.db
 
 # Playwright
 playwright/.cache/
+
+# Worker working-directory runtime data
+**/data/instagram-storage-state.json
+**/data/*.db
+**/data/*.db-*
+**/data/tmp/
+**/data/worker.lock
+**/archive/
+**/logs/
