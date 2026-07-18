@@ -20,6 +20,7 @@ public class InstagramStoryResponseParserTests
                 "pk": "111",
                 "id": "111_222",
                 "taken_at": 1700000000,
+                "expiring_at": 1700086400,
                 "media_type": 2,
                 "video_versions": [{ "url": "https://scontent.cdninstagram.com/v/t50.video/video123.mp4", "width": 720, "height": 1280 }],
                 "user": { "username": "demo" }
@@ -43,16 +44,19 @@ public class InstagramStoryResponseParserTests
     {
         var json = """
         {
-          "items": [{
-            "pk": "999",
-            "taken_at": 1700001111,
-            "user": { "username": "demo" },
-            "image_versions2": {
-              "candidates": [
-                { "url": "https://scontent.cdninstagram.com/v/t51.photo/small.jpg", "width": 320, "height": 320 },
-                { "url": "https://scontent.cdninstagram.com/v/t51.photo/large.jpg", "width": 1080, "height": 1920 }
-              ]
-            }
+          "reels_media": [{
+            "items": [{
+              "pk": "999",
+              "taken_at": 1700001111,
+              "expiring_at": 1700087511,
+              "user": { "username": "demo" },
+              "image_versions2": {
+                "candidates": [
+                  { "url": "https://scontent.cdninstagram.com/v/t51.photo/small.jpg", "width": 320, "height": 320 },
+                  { "url": "https://scontent.cdninstagram.com/v/t51.photo/large.jpg", "width": 1080, "height": 1920 }
+                ]
+              }
+            }]
           }]
         }
         """;
@@ -65,11 +69,35 @@ public class InstagramStoryResponseParserTests
     }
 
     [Fact]
+    public void Parse_SkipsFeedPostsWithoutStoryMarkers()
+    {
+        var json = """
+        {
+          "items": [{
+            "pk": "post-1",
+            "taken_at": 1700001111,
+            "comment_count": 12,
+            "user": { "username": "demo" },
+            "image_versions2": {
+              "candidates": [
+                { "url": "https://scontent.cdninstagram.com/v/t51.photo/feedpost.jpg", "width": 1080, "height": 1080 }
+              ]
+            }
+          }]
+        }
+        """;
+
+        var results = _parser.Parse(json, "demo");
+        Assert.Empty(results);
+    }
+
+    [Fact]
     public void Parse_SkipsMediaForUnexpectedUsername()
     {
         var json = """
         {
           "pk": "1",
+          "expiring_at": 1700086400,
           "video_url": "https://scontent.cdninstagram.com/v/t50.video/x.mp4",
           "user": { "username": "someoneelse" }
         }
@@ -97,7 +125,7 @@ public class InstagramStoryResponseParserTests
     public void Parse_StripsForLoopPrefixAndExtractsMedia()
     {
         var json = """
-        for (;;);{"pk":"77","taken_at":1700000000,"user":{"username":"demo"},"video_versions":[{"url":"https://scontent.cdninstagram.com/v/t50.video/x.mp4","width":720,"height":1280}]}
+        for (;;);{"pk":"77","taken_at":1700000000,"expiring_at":1700086400,"user":{"username":"demo"},"video_versions":[{"url":"https://scontent.cdninstagram.com/v/t50.video/x.mp4","width":720,"height":1280}]}
         """;
 
         var results = _parser.Parse(json, "demo");
@@ -121,6 +149,7 @@ public class InstagramStoryResponseParserTests
         var json = """
         {
           "pk": "55",
+          "expiring_at": 1700086400,
           "timestamp": "2026-07-18T15:00:00Z",
           "user": { "username": "demo" },
           "image_versions2": {

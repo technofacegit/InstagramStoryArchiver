@@ -7,6 +7,7 @@ using InstagramStoryArchiver.Domain.Models;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Microsoft.Playwright;
+using IAppClock = InstagramStoryArchiver.Application.Abstractions.IClock;
 
 namespace InstagramStoryArchiver.Infrastructure.Playwright;
 
@@ -15,6 +16,7 @@ public sealed class InstagramStoryDetector : IInstagramStoryDetector
     private readonly IInstagramBrowserService _browserService;
     private readonly IInstagramSessionService _sessionService;
     private readonly IInstagramStoryResponseParser _parser;
+    private readonly IAppClock _clock;
     private readonly InstagramOptions _options;
     private readonly ILogger<InstagramStoryDetector> _logger;
 
@@ -22,12 +24,14 @@ public sealed class InstagramStoryDetector : IInstagramStoryDetector
         IInstagramBrowserService browserService,
         IInstagramSessionService sessionService,
         IInstagramStoryResponseParser parser,
+        IAppClock clock,
         IOptions<InstagramOptions> options,
         ILogger<InstagramStoryDetector> logger)
     {
         _browserService = browserService;
         _sessionService = sessionService;
         _parser = parser;
+        _clock = clock;
         _options = options.Value;
         _logger = logger;
     }
@@ -38,11 +42,17 @@ public sealed class InstagramStoryDetector : IInstagramStoryDetector
     {
         var normalized = UsernameNormalizer.Normalize(username);
         var collected = new Dictionary<string, InstagramStoryMedia>(StringComparer.Ordinal);
+        var captureEnabled = false;
         IPage? page = null;
         EventHandler<IResponse>? responseHandler = null;
 
         void Ingest(IEnumerable<InstagramStoryMedia> items)
         {
+            if (!captureEnabled)
+            {
+                return;
+            }
+
             foreach (var item in items)
             {
                 if (!string.IsNullOrWhiteSpace(item.Username)
@@ -52,6 +62,16 @@ public sealed class InstagramStoryDetector : IInstagramStoryDetector
                         "Ignoring story media for unexpected username {Actual} (expected {Expected})",
                         item.Username,
                         normalized);
+                    continue;
+                }
+
+                if (!IsPlausibleActiveStory(item))
+                {
+                    _logger.LogInformation(
+                        "Skipping non-story/expired media for {Username}, StoryId={StoryId}, PublishedAt={PublishedAt}",
+                        normalized,
+                        item.StoryId,
+                        item.PublishedAt);
                     continue;
                 }
 
@@ -76,6 +96,11 @@ public sealed class InstagramStoryDetector : IInstagramStoryDetector
             {
                 try
                 {
+                    if (!captureEnabled)
+                    {
+                        return;
+                    }
+
                     var contentType = response.Headers.TryGetValue("content-type", out var ct) ? ct : string.Empty;
                     var url = response.Url;
 
@@ -137,8 +162,12 @@ public sealed class InstagramStoryDetector : IInstagramStoryDetector
                 throw new InstagramStoryDetectionException($"Profile not found for '{normalized}'.");
             }
 
-            // Allow SPA hydration / GraphQL profile payloads.
+            // Allow SPA hydration. Do NOT capture profile feed/post GraphQL here.
             await page.WaitForTimeoutAsync(2500);
+
+            // Enable capture only for the story-open phase (not profile grid posts).
+            collected.Clear();
+            captureEnabled = true;
 
             var opened = await TryOpenStoryViewerAsync(page, normalized, cancellationToken);
             if (!opened)
@@ -151,20 +180,30 @@ public sealed class InstagramStoryDetector : IInstagramStoryDetector
 
             if (!opened)
             {
+                captureEnabled = false;
+                collected.Clear();
                 _logger.LogInformation("No active story detected for {Username}", normalized);
                 return Array.Empty<InstagramStoryMedia>();
             }
 
-            await _sessionService.DetectSessionProblemsAsync(page.Url, cancellationToken);
-            await page.WaitForTimeoutAsync(2500);
+            _logger.LogInformation("Story viewer open for {Username}; collecting story media only.", normalized);
 
-            // Collect any media already visible in the viewer DOM as a fallback.
-            Ingest(await ExtractMediaFromStoryViewerDomAsync(page, normalized));
+            await _sessionService.DetectSessionProblemsAsync(page.Url, cancellationToken);
+            await page.WaitForTimeoutAsync(3000);
+
+            if (page.Url.Contains($"/stories/{normalized}", StringComparison.OrdinalIgnoreCase))
+            {
+                Ingest(await ExtractMediaFromStoryViewerDomAsync(page, normalized));
+            }
 
             await AdvanceThroughStoriesAsync(page, normalized, cancellationToken);
 
-            // Second DOM scrape after advancing.
-            Ingest(await ExtractMediaFromStoryViewerDomAsync(page, normalized));
+            if (page.Url.Contains($"/stories/{normalized}", StringComparison.OrdinalIgnoreCase))
+            {
+                Ingest(await ExtractMediaFromStoryViewerDomAsync(page, normalized));
+            }
+
+            await page.WaitForTimeoutAsync(1500);
 
             try
             {
@@ -507,6 +546,18 @@ public sealed class InstagramStoryDetector : IInstagramStoryDetector
         return best;
     }
 
+    private bool IsPlausibleActiveStory(InstagramStoryMedia item)
+    {
+        // Stories expire ~24h after publish. Reject older feed posts mistaken as stories.
+        if (item.PublishedAt is null)
+        {
+            return true;
+        }
+
+        var age = _clock.UtcNow - item.PublishedAt.Value;
+        return age <= TimeSpan.FromHours(36) && age >= TimeSpan.FromHours(-2);
+    }
+
     private static bool LooksLikeCdnMedia(string url)
         => url.Contains("cdninstagram", StringComparison.OrdinalIgnoreCase)
            || url.Contains("fbcdn", StringComparison.OrdinalIgnoreCase)
@@ -528,16 +579,23 @@ public sealed class InstagramStoryDetector : IInstagramStoryDetector
             return false;
         }
 
-        var isJsonContent = contentType.Contains("json", StringComparison.OrdinalIgnoreCase);
-        var isApiPath =
-            url.Contains("/api/", StringComparison.OrdinalIgnoreCase)
-            || url.Contains("graphql", StringComparison.OrdinalIgnoreCase)
-            || url.Contains("/stories/", StringComparison.OrdinalIgnoreCase)
-            || url.Contains("reel", StringComparison.OrdinalIgnoreCase)
-            || url.Contains("feed", StringComparison.OrdinalIgnoreCase)
-            || url.Contains("media", StringComparison.OrdinalIgnoreCase)
-            || url.Contains("query", StringComparison.OrdinalIgnoreCase);
+        // Exclude common feed/post endpoints that are not stories.
+        if (url.Contains("user_timeline", StringComparison.OrdinalIgnoreCase)
+            || url.Contains("feed/timeline", StringComparison.OrdinalIgnoreCase)
+            || url.Contains("media_info", StringComparison.OrdinalIgnoreCase)
+            || url.Contains("/p/", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
 
-        return isJsonContent || isApiPath;
+        var isStoryPath =
+            url.Contains("/stories/", StringComparison.OrdinalIgnoreCase)
+            || url.Contains("reels_media", StringComparison.OrdinalIgnoreCase)
+            || url.Contains("user_story", StringComparison.OrdinalIgnoreCase)
+            || url.Contains("story_tray", StringComparison.OrdinalIgnoreCase)
+            || url.Contains("graphql", StringComparison.OrdinalIgnoreCase)
+            || url.Contains("/api/", StringComparison.OrdinalIgnoreCase);
+
+        return isStoryPath;
     }
 }

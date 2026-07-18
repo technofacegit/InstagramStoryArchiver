@@ -9,6 +9,20 @@ namespace InstagramStoryArchiver.Infrastructure.Playwright;
 
 public sealed class InstagramStoryResponseParser : IInstagramStoryResponseParser
 {
+    private static readonly HashSet<string> StoryContextPropertyNames = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "reels_media",
+        "reel",
+        "reels",
+        "stories",
+        "story",
+        "tray",
+        "story_tray",
+        "xdt_api__v1__feed__reels_media",
+        "xdt_api__v1__feed__user_story",
+        "user_story"
+    };
+
     private readonly ILogger<InstagramStoryResponseParser> _logger;
 
     public InstagramStoryResponseParser(ILogger<InstagramStoryResponseParser> logger)
@@ -30,7 +44,7 @@ public sealed class InstagramStoryResponseParser : IInstagramStoryResponseParser
         try
         {
             using var document = JsonDocument.Parse(payload);
-            Walk(document.RootElement, expectedUsername, results, seen, depth: 0);
+            Walk(document.RootElement, expectedUsername, results, seen, depth: 0, inStoryContext: false);
         }
         catch (JsonException ex)
         {
@@ -44,10 +58,6 @@ public sealed class InstagramStoryResponseParser : IInstagramStoryResponseParser
         return results;
     }
 
-    /// <summary>
-    /// Instagram sometimes prefixes JSON with anti-hijacking tokens such as "for (;;);"
-    /// or returns plain JS that is not JSON. Only return a body that can be parsed as JSON.
-    /// </summary>
     public static string? ExtractJsonPayload(string? raw)
     {
         if (string.IsNullOrWhiteSpace(raw))
@@ -57,7 +67,6 @@ public sealed class InstagramStoryResponseParser : IInstagramStoryResponseParser
 
         var text = raw.TrimStart();
 
-        // Common Instagram/Facebook JSON hijacking prefix.
         const string forLoopPrefix = "for (;;);";
         if (text.StartsWith(forLoopPrefix, StringComparison.Ordinal))
         {
@@ -88,7 +97,8 @@ public sealed class InstagramStoryResponseParser : IInstagramStoryResponseParser
         string expectedUsername,
         List<InstagramStoryMedia> results,
         HashSet<string> seen,
-        int depth)
+        int depth,
+        bool inStoryContext)
     {
         if (depth > 40)
         {
@@ -98,16 +108,17 @@ public sealed class InstagramStoryResponseParser : IInstagramStoryResponseParser
         switch (element.ValueKind)
         {
             case JsonValueKind.Object:
-                TryExtractMedia(element, expectedUsername, results, seen);
+                TryExtractMedia(element, expectedUsername, results, seen, inStoryContext);
                 foreach (var property in element.EnumerateObject())
                 {
-                    Walk(property.Value, expectedUsername, results, seen, depth + 1);
+                    var childIsStoryContext = inStoryContext || StoryContextPropertyNames.Contains(property.Name);
+                    Walk(property.Value, expectedUsername, results, seen, depth + 1, childIsStoryContext);
                 }
                 break;
             case JsonValueKind.Array:
                 foreach (var item in element.EnumerateArray())
                 {
-                    Walk(item, expectedUsername, results, seen, depth + 1);
+                    Walk(item, expectedUsername, results, seen, depth + 1, inStoryContext);
                 }
                 break;
         }
@@ -117,11 +128,16 @@ public sealed class InstagramStoryResponseParser : IInstagramStoryResponseParser
         JsonElement element,
         string expectedUsername,
         List<InstagramStoryMedia> results,
-        HashSet<string> seen)
+        HashSet<string> seen,
+        bool inStoryContext)
     {
         try
         {
-            // Require a media container signal to avoid treating CDN candidate nodes as stories.
+            if (!IsStoryMediaNode(element, inStoryContext))
+            {
+                return;
+            }
+
             var hasMediaContainer =
                 HasProperty(element, "video_versions")
                 || HasProperty(element, "video_url")
@@ -137,12 +153,7 @@ public sealed class InstagramStoryResponseParser : IInstagramStoryResponseParser
             var videoUrl = FindString(element, "video_url", "video_versions");
             var imageUrl = FindBestImageUrl(element);
             var mediaUrl = videoUrl ?? imageUrl;
-            if (string.IsNullOrWhiteSpace(mediaUrl))
-            {
-                return;
-            }
-
-            if (!LooksLikeMediaUrl(mediaUrl))
+            if (string.IsNullOrWhiteSpace(mediaUrl) || !LooksLikeMediaUrl(mediaUrl))
             {
                 return;
             }
@@ -192,6 +203,40 @@ public sealed class InstagramStoryResponseParser : IInstagramStoryResponseParser
         {
             _logger.LogDebug(ex, "Skipped a JSON node during story media extraction.");
         }
+    }
+
+    /// <summary>
+    /// Stories typically have <c>expiring_at</c> or live under reels/story trays.
+    /// Feed posts share image_versions2/video_versions but must not be archived as stories.
+    /// </summary>
+    private static bool IsStoryMediaNode(JsonElement element, bool inStoryContext)
+    {
+        if (HasProperty(element, "expiring_at"))
+        {
+            return true;
+        }
+
+        if (element.TryGetProperty("product_type", out var productType)
+            && productType.ValueKind == JsonValueKind.String
+            && string.Equals(productType.GetString(), "story", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        // Explicit feed/post signals without story markers => reject.
+        if (HasProperty(element, "carousel_media")
+            || HasProperty(element, "edge_media_to_caption")
+            || HasProperty(element, "comment_count")
+            || HasProperty(element, "like_and_view_counts_disabled"))
+        {
+            if (!inStoryContext)
+            {
+                return false;
+            }
+        }
+
+        // Only accept media nodes when we are already inside a story/reels tray payload.
+        return inStoryContext;
     }
 
     private static bool HasProperty(JsonElement element, string name)
@@ -253,7 +298,6 @@ public sealed class InstagramStoryResponseParser : IInstagramStoryResponseParser
             }
         }
 
-        // Avoid treating arbitrary "url" properties on nested candidate nodes as story media.
         return FindStringScalar(element, "display_url", "image_url");
     }
 
@@ -351,6 +395,12 @@ public sealed class InstagramStoryResponseParser : IInstagramStoryResponseParser
     {
         foreach (var key in new[] { "taken_at", "expiring_at", "device_timestamp", "timestamp" })
         {
+            // Prefer taken_at for PublishedAt; expiring_at is only a story marker.
+            if (key == "expiring_at")
+            {
+                continue;
+            }
+
             if (!element.TryGetProperty(key, out var value))
             {
                 continue;
