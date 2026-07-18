@@ -48,7 +48,7 @@ public sealed class InstagramStoryResponseParser : IInstagramStoryResponseParser
     /// Instagram sometimes prefixes JSON with anti-hijacking tokens such as "for (;;);"
     /// or returns plain JS that is not JSON. Only return a body that can be parsed as JSON.
     /// </summary>
-    internal static string? ExtractJsonPayload(string? raw)
+    public static string? ExtractJsonPayload(string? raw)
     {
         if (string.IsNullOrWhiteSpace(raw))
         {
