@@ -49,15 +49,9 @@ public sealed class InstagramStoryDetector : IInstagramStoryDetector
                 try
                 {
                     var contentType = response.Headers.TryGetValue("content-type", out var ct) ? ct : string.Empty;
-                    if (!contentType.Contains("json", StringComparison.OrdinalIgnoreCase)
-                        && !contentType.Contains("javascript", StringComparison.OrdinalIgnoreCase))
-                    {
-                        return;
-                    }
-
                     var url = response.Url;
-                    if (!url.Contains("instagram.com", StringComparison.OrdinalIgnoreCase)
-                        && !url.Contains("facebook.com", StringComparison.OrdinalIgnoreCase))
+
+                    if (!LooksLikeStoryApiResponse(url, contentType))
                     {
                         return;
                     }
@@ -236,5 +230,32 @@ public sealed class InstagramStoryDetector : IInstagramStoryDetector
                 await page.CloseAsync();
             }
         }
+    }
+
+    private static bool LooksLikeStoryApiResponse(string url, string contentType)
+    {
+        if (!url.Contains("instagram.com", StringComparison.OrdinalIgnoreCase)
+            && !url.Contains("facebook.com", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        // Ignore static JS bundles; they are not story media payloads.
+        if (url.Contains(".js", StringComparison.OrdinalIgnoreCase)
+            && !url.Contains("graphql", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var isJsonContent = contentType.Contains("json", StringComparison.OrdinalIgnoreCase);
+        var isApiPath =
+            url.Contains("/api/", StringComparison.OrdinalIgnoreCase)
+            || url.Contains("graphql", StringComparison.OrdinalIgnoreCase)
+            || url.Contains("/stories/", StringComparison.OrdinalIgnoreCase)
+            || url.Contains("reel", StringComparison.OrdinalIgnoreCase)
+            || url.Contains("feed", StringComparison.OrdinalIgnoreCase)
+            || url.Contains("media", StringComparison.OrdinalIgnoreCase);
+
+        return isJsonContent || isApiPath;
     }
 }

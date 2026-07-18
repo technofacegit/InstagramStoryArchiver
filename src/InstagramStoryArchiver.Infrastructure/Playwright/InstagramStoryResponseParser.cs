@@ -21,14 +21,20 @@ public sealed class InstagramStoryResponseParser : IInstagramStoryResponseParser
         var results = new List<InstagramStoryMedia>();
         var seen = new HashSet<string>(StringComparer.Ordinal);
 
+        var payload = ExtractJsonPayload(json);
+        if (payload is null)
+        {
+            return results;
+        }
+
         try
         {
-            using var document = JsonDocument.Parse(json);
+            using var document = JsonDocument.Parse(payload);
             Walk(document.RootElement, expectedUsername, results, seen, depth: 0);
         }
         catch (JsonException ex)
         {
-            _logger.LogWarning(ex, "Failed to parse Instagram JSON response. Continuing.");
+            _logger.LogDebug(ex, "Skipped non-JSON or unsupported Instagram response body.");
         }
         catch (Exception ex)
         {
@@ -36,6 +42,45 @@ public sealed class InstagramStoryResponseParser : IInstagramStoryResponseParser
         }
 
         return results;
+    }
+
+    /// <summary>
+    /// Instagram sometimes prefixes JSON with anti-hijacking tokens such as "for (;;);"
+    /// or returns plain JS that is not JSON. Only return a body that can be parsed as JSON.
+    /// </summary>
+    internal static string? ExtractJsonPayload(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return null;
+        }
+
+        var text = raw.TrimStart();
+
+        // Common Instagram/Facebook JSON hijacking prefix.
+        const string forLoopPrefix = "for (;;);";
+        if (text.StartsWith(forLoopPrefix, StringComparison.Ordinal))
+        {
+            text = text[forLoopPrefix.Length..].TrimStart();
+        }
+
+        while (text.Length > 0 && text[0] == ';')
+        {
+            text = text[1..].TrimStart();
+        }
+
+        if (text.Length == 0)
+        {
+            return null;
+        }
+
+        var first = text[0];
+        if (first is not ('{' or '['))
+        {
+            return null;
+        }
+
+        return text;
     }
 
     private void Walk(

@@ -87,6 +87,35 @@ public class InstagramStoryResponseParserTests
     }
 
     [Fact]
+    public void Parse_IgnoresJavaScriptBodiesStartingWithSemicolon()
+    {
+        var results = _parser.Parse(";!function(){window.foo=1;}();", "demo");
+        Assert.Empty(results);
+    }
+
+    [Fact]
+    public void Parse_StripsForLoopPrefixAndExtractsMedia()
+    {
+        var json = """
+        for (;;);{"pk":"77","taken_at":1700000000,"user":{"username":"demo"},"video_versions":[{"url":"https://scontent.cdninstagram.com/v/t50.video/x.mp4","width":720,"height":1280}]}
+        """;
+
+        var results = _parser.Parse(json, "demo");
+        Assert.Single(results);
+        Assert.Equal(StoryMediaType.Video, results[0].MediaType);
+    }
+
+    [Theory]
+    [InlineData("for (;;);{\"a\":1}", "{\"a\":1}")]
+    [InlineData("  ;{\"a\":1}", "{\"a\":1}")]
+    [InlineData(";!function(){}", null)]
+    [InlineData("not json", null)]
+    public void ExtractJsonPayload_HandlesPrefixes(string input, string? expected)
+    {
+        Assert.Equal(expected, InstagramStoryResponseParser.ExtractJsonPayload(input));
+    }
+
+    [Fact]
     public void Parse_ExtractsTimestampFromString()
     {
         var json = """
