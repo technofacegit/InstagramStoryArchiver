@@ -1,0 +1,20 @@
+services:
+  instagram-story-archiver:
+    build: .
+    container_name: instagram-story-archiver
+    restart: unless-stopped
+    environment:
+      DOTNET_ENVIRONMENT: Docker
+      ASPNETCORE_ENVIRONMENT: Docker
+      Instagram__Headless: "true"
+      Instagram__StorageStatePath: /app/data/instagram-storage-state.json
+      Storage__ArchiveRootPath: /app/archive
+      Storage__TemporaryRootPath: /app/data/tmp
+      Storage__LockFilePath: /app/data/worker.lock
+      ConnectionStrings__DefaultConnection: Data Source=/app/data/instagram-story-archiver.db
+    volumes:
+      - ./data:/app/data
+      - ./archive:/app/archive
+      - ./logs:/app/logs
+    # Session expired exits with code 2. Restart policy still applies; ensure storage
+    # state is refreshed via local `dotnet run -- login` before restarting the container.

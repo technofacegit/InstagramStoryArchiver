@@ -1,0 +1,27 @@
+##ignore C# build outputs
+bin/
+obj/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+.vs/
+.idea/
+
+# Sensitive / runtime data
+data/instagram-storage-state.json
+data/*.db
+data/*.db-*
+data/tmp/
+data/worker.lock
+archive/
+logs/
+.env
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Playwright
+playwright/.cache/
