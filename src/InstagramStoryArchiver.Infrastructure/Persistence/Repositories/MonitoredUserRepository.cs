@@ -17,11 +17,17 @@ public sealed class MonitoredUserRepository : IMonitoredUserRepository
         DateTimeOffset now,
         CancellationToken cancellationToken)
     {
-        return await _dbContext.MonitoredUsers
-            .Where(x => x.IsActive && (x.NextCheckAt == null || x.NextCheckAt <= now))
+        // SQLite EF provider cannot reliably translate nullable DateTimeOffset comparisons.
+        // Active set is small (max ~15), so filter due users in memory.
+        var activeUsers = await _dbContext.MonitoredUsers
+            .Where(x => x.IsActive)
+            .ToListAsync(cancellationToken);
+
+        return activeUsers
+            .Where(x => x.NextCheckAt is null || x.NextCheckAt <= now)
             .OrderBy(x => x.NextCheckAt)
             .ThenBy(x => x.Username)
-            .ToListAsync(cancellationToken);
+            .ToList();
     }
 
     public async Task<IReadOnlyList<MonitoredInstagramUser>> GetAllAsync(CancellationToken cancellationToken)
