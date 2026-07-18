@@ -1,6 +1,7 @@
 using InstagramStoryArchiver.Application.Abstractions;
 using InstagramStoryArchiver.Application.Options;
 using InstagramStoryArchiver.Application.Utilities;
+using InstagramStoryArchiver.Domain.Enums;
 using InstagramStoryArchiver.Domain.Exceptions;
 using InstagramStoryArchiver.Domain.Models;
 using Microsoft.Extensions.Logging;
@@ -40,6 +41,33 @@ public sealed class InstagramStoryDetector : IInstagramStoryDetector
         IPage? page = null;
         EventHandler<IResponse>? responseHandler = null;
 
+        void Ingest(IEnumerable<InstagramStoryMedia> items)
+        {
+            foreach (var item in items)
+            {
+                if (!string.IsNullOrWhiteSpace(item.Username)
+                    && !string.Equals(item.Username, normalized, StringComparison.OrdinalIgnoreCase))
+                {
+                    _logger.LogWarning(
+                        "Ignoring story media for unexpected username {Actual} (expected {Expected})",
+                        item.Username,
+                        normalized);
+                    continue;
+                }
+
+                var normalizedItem = new InstagramStoryMedia
+                {
+                    StoryId = item.StoryId,
+                    InstagramStoryId = item.InstagramStoryId,
+                    Username = normalized,
+                    MediaType = item.MediaType,
+                    MediaUrl = item.MediaUrl,
+                    PublishedAt = item.PublishedAt
+                };
+                collected[normalizedItem.StoryId] = normalizedItem;
+            }
+        }
+
         try
         {
             page = await _browserService.CreatePageAsync(cancellationToken);
@@ -77,20 +105,7 @@ public sealed class InstagramStoryDetector : IInstagramStoryDetector
                         return;
                     }
 
-                    var parsed = _parser.Parse(body, normalized);
-                    foreach (var item in parsed)
-                    {
-                        if (!string.Equals(item.Username, normalized, StringComparison.OrdinalIgnoreCase))
-                        {
-                            _logger.LogWarning(
-                                "Ignoring story media for unexpected username {Actual} (expected {Expected})",
-                                item.Username,
-                                normalized);
-                            continue;
-                        }
-
-                        collected[item.StoryId] = item;
-                    }
+                    Ingest(_parser.Parse(body, normalized));
                 }
                 catch (Exception ex)
                 {
@@ -122,77 +137,34 @@ public sealed class InstagramStoryDetector : IInstagramStoryDetector
                 throw new InstagramStoryDetectionException($"Profile not found for '{normalized}'.");
             }
 
-            var storyLink = page.Locator($"a[href*='/stories/{normalized}']").First;
-            var hasStoryLink = await storyLink.CountAsync() > 0;
+            // Allow SPA hydration / GraphQL profile payloads.
+            await page.WaitForTimeoutAsync(2500);
 
-            if (!hasStoryLink)
+            var opened = await TryOpenStoryViewerAsync(page, normalized, cancellationToken);
+            if (!opened)
             {
-                var genericStoryLinks = page.Locator(InstagramLocators.ProfileStoryRingSelector);
-                var count = await genericStoryLinks.CountAsync();
-                for (var i = 0; i < count; i++)
-                {
-                    var href = await genericStoryLinks.Nth(i).GetAttributeAsync("href");
-                    if (href is not null
-                        && href.Contains($"/stories/{normalized}", StringComparison.OrdinalIgnoreCase))
-                    {
-                        storyLink = genericStoryLinks.Nth(i);
-                        hasStoryLink = true;
-                        break;
-                    }
-                }
+                _logger.LogInformation(
+                    "DOM story ring not found for {Username}. Trying direct stories URL.",
+                    normalized);
+                opened = await TryOpenStoriesByDirectUrlAsync(page, normalized, cancellationToken);
             }
 
-            if (!hasStoryLink)
+            if (!opened)
             {
-                _logger.LogInformation("No active story detected via DOM for {Username}", normalized);
+                _logger.LogInformation("No active story detected for {Username}", normalized);
                 return Array.Empty<InstagramStoryMedia>();
             }
 
-            _logger.LogInformation("Active story ring found for {Username}. Opening story viewer.", normalized);
-            await storyLink.ClickAsync();
-
-            try
-            {
-                await page.WaitForURLAsync(
-                    url => url.Contains("/stories/", StringComparison.OrdinalIgnoreCase),
-                    new PageWaitForURLOptions { Timeout = _options.StoryLoadTimeoutSeconds * 1000 });
-            }
-            catch (TimeoutException)
-            {
-                _logger.LogWarning("Story viewer URL did not appear for {Username} within timeout.", normalized);
-            }
-
             await _sessionService.DetectSessionProblemsAsync(page.Url, cancellationToken);
-            await page.WaitForTimeoutAsync(2000);
+            await page.WaitForTimeoutAsync(2500);
 
-            // Advance through stories belonging to this user to capture network payloads.
-            for (var i = 0; i < 15; i++)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
+            // Collect any media already visible in the viewer DOM as a fallback.
+            Ingest(await ExtractMediaFromStoryViewerDomAsync(page, normalized));
 
-                if (!page.Url.Contains($"/stories/{normalized}", StringComparison.OrdinalIgnoreCase)
-                    && page.Url.Contains("/stories/", StringComparison.OrdinalIgnoreCase))
-                {
-                    _logger.LogInformation("Story viewer moved away from {Username}. Stopping advancement.", normalized);
-                    break;
-                }
+            await AdvanceThroughStoriesAsync(page, normalized, cancellationToken);
 
-                var nextButton = page.GetByRole(AriaRole.Button, new PageGetByRoleOptions { Name = InstagramLocators.NextStoryButtonAria });
-                if (await nextButton.CountAsync() == 0)
-                {
-                    break;
-                }
-
-                try
-                {
-                    await nextButton.First.ClickAsync(new LocatorClickOptions { Timeout = 2000 });
-                    await page.WaitForTimeoutAsync(800);
-                }
-                catch (PlaywrightException)
-                {
-                    break;
-                }
-            }
+            // Second DOM scrape after advancing.
+            Ingest(await ExtractMediaFromStoryViewerDomAsync(page, normalized));
 
             try
             {
@@ -204,7 +176,7 @@ public sealed class InstagramStoryDetector : IInstagramStoryDetector
             }
 
             _logger.LogInformation(
-                "Collected {Count} story media items for {Username} from network responses",
+                "Collected {Count} story media items for {Username}",
                 collected.Count,
                 normalized);
 
@@ -232,6 +204,316 @@ public sealed class InstagramStoryDetector : IInstagramStoryDetector
         }
     }
 
+    private async Task<bool> TryOpenStoryViewerAsync(IPage page, string username, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        // 1) Explicit story href (older UI).
+        var storyHref = page.Locator($"a[href*='/stories/{username}']").First;
+        if (await storyHref.CountAsync() > 0 && await storyHref.IsVisibleAsync())
+        {
+            _logger.LogInformation("Active story link found for {Username}. Clicking.", username);
+            await storyHref.ClickAsync();
+            return await WaitForStoryViewerAsync(page, username);
+        }
+
+        // 2) Any /stories/ link that belongs to this user.
+        var anyStoryLinks = page.Locator(InstagramLocators.ProfileStoryLinkSelector);
+        var linkCount = await anyStoryLinks.CountAsync();
+        for (var i = 0; i < linkCount; i++)
+        {
+            var href = await anyStoryLinks.Nth(i).GetAttributeAsync("href");
+            if (href is not null && href.Contains($"/stories/{username}", StringComparison.OrdinalIgnoreCase))
+            {
+                _logger.LogInformation("Active story href found for {Username}. Clicking.", username);
+                await anyStoryLinks.Nth(i).ClickAsync();
+                return await WaitForStoryViewerAsync(page, username);
+            }
+        }
+
+        // 3) Modern UI: canvas story ring in header — click the nearest button/parent.
+        var canvas = page.Locator(InstagramLocators.ProfileHeaderCanvasSelector).First;
+        if (await canvas.CountAsync() > 0 && await canvas.IsVisibleAsync())
+        {
+            _logger.LogInformation("Story ring canvas found for {Username}. Clicking ring.", username);
+            try
+            {
+                var clickable = canvas.Locator("xpath=ancestor::*[@role='button'][1]");
+                if (await clickable.CountAsync() > 0)
+                {
+                    await clickable.ClickAsync();
+                }
+                else
+                {
+                    await canvas.ClickAsync();
+                }
+
+                if (await WaitForStoryViewerAsync(page, username))
+                {
+                    return true;
+                }
+            }
+            catch (PlaywrightException ex)
+            {
+                _logger.LogDebug(ex, "Canvas click did not open story viewer.");
+            }
+        }
+
+        // 4) Click profile photo in header (often opens story when ring is active).
+        var photo = page.Locator(InstagramLocators.ProfileHeaderPhotoButtonSelector).First;
+        if (await photo.CountAsync() > 0 && await photo.IsVisibleAsync())
+        {
+            _logger.LogInformation("Clicking profile photo for {Username} to open story.", username);
+            try
+            {
+                var button = photo.Locator("xpath=ancestor::*[@role='button'][1]");
+                if (await button.CountAsync() > 0)
+                {
+                    await button.ClickAsync();
+                }
+                else
+                {
+                    await photo.ClickAsync();
+                }
+
+                if (await WaitForStoryViewerAsync(page, username))
+                {
+                    return true;
+                }
+            }
+            catch (PlaywrightException ex)
+            {
+                _logger.LogDebug(ex, "Profile photo click did not open story viewer.");
+            }
+        }
+
+        return false;
+    }
+
+    private async Task<bool> TryOpenStoriesByDirectUrlAsync(IPage page, string username, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var storiesUrl = $"{_options.BaseUrl.TrimEnd('/')}/stories/{username}/";
+        _logger.LogInformation("Navigating directly to {Url}", storiesUrl);
+
+        try
+        {
+            await page.GotoAsync(storiesUrl, new PageGotoOptions { WaitUntil = WaitUntilState.DOMContentLoaded });
+        }
+        catch (TimeoutException ex)
+        {
+            _logger.LogWarning(ex, "Timeout opening direct stories URL for {Username}", username);
+            return false;
+        }
+
+        await page.WaitForTimeoutAsync(2000);
+        await _sessionService.DetectSessionProblemsAsync(page.Url, cancellationToken);
+
+        if (page.Url.Contains($"/stories/{username}", StringComparison.OrdinalIgnoreCase))
+        {
+            _logger.LogInformation("Direct stories URL stayed on viewer for {Username}", username);
+            return true;
+        }
+
+        // Instagram may redirect to profile when there is no active story.
+        _logger.LogInformation(
+            "Direct stories URL redirected away for {Username} (url={Url}). Treating as no active story.",
+            username,
+            page.Url);
+        return false;
+    }
+
+    private async Task<bool> WaitForStoryViewerAsync(IPage page, string username)
+    {
+        try
+        {
+            await page.WaitForURLAsync(
+                url => url.Contains("/stories/", StringComparison.OrdinalIgnoreCase),
+                new PageWaitForURLOptions { Timeout = _options.StoryLoadTimeoutSeconds * 1000 });
+        }
+        catch (TimeoutException)
+        {
+            _logger.LogDebug("Story viewer URL did not appear for {Username} within timeout.", username);
+        }
+
+        if (page.Url.Contains($"/stories/{username}", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        // Some builds open a dialog without changing URL immediately.
+        var media = page.Locator(InstagramLocators.StoryViewerMediaSelector);
+        if (await media.CountAsync() > 0)
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+    private async Task AdvanceThroughStoriesAsync(IPage page, string username, CancellationToken cancellationToken)
+    {
+        for (var i = 0; i < 15; i++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            if (page.Url.Contains("/stories/", StringComparison.OrdinalIgnoreCase)
+                && !page.Url.Contains($"/stories/{username}", StringComparison.OrdinalIgnoreCase))
+            {
+                _logger.LogInformation("Story viewer moved away from {Username}. Stopping advancement.", username);
+                break;
+            }
+
+            // Prefer keyboard right-arrow; more reliable than aria-labelled Next across locales.
+            try
+            {
+                await page.Keyboard.PressAsync("ArrowRight");
+                await page.WaitForTimeoutAsync(900);
+            }
+            catch (PlaywrightException)
+            {
+                break;
+            }
+
+            var nextButton = page.GetByRole(AriaRole.Button, new PageGetByRoleOptions { Name = InstagramLocators.NextStoryButtonAria });
+            if (await nextButton.CountAsync() > 0)
+            {
+                try
+                {
+                    await nextButton.First.ClickAsync(new LocatorClickOptions { Timeout = 1500 });
+                    await page.WaitForTimeoutAsync(700);
+                }
+                catch (PlaywrightException)
+                {
+                    // Keyboard may already have advanced.
+                }
+            }
+        }
+    }
+
+    private async Task<IReadOnlyList<InstagramStoryMedia>> ExtractMediaFromStoryViewerDomAsync(IPage page, string username)
+    {
+        var results = new List<InstagramStoryMedia>();
+        try
+        {
+            var videos = page.Locator("video[src], video source[src]");
+            var videoCount = await videos.CountAsync();
+            for (var i = 0; i < videoCount; i++)
+            {
+                var src = await videos.Nth(i).GetAttributeAsync("src");
+                if (string.IsNullOrWhiteSpace(src)
+                    || src.StartsWith("blob:", StringComparison.OrdinalIgnoreCase)
+                    || !LooksLikeCdnMedia(src))
+                {
+                    continue;
+                }
+
+                var key = StoryFingerprint.Create(null, username, src, publishedAt: null);
+                results.Add(new InstagramStoryMedia
+                {
+                    StoryId = key,
+                    InstagramStoryId = null,
+                    Username = username,
+                    MediaType = StoryMediaType.Video,
+                    MediaUrl = src,
+                    PublishedAt = null
+                });
+            }
+
+            var images = page.Locator(InstagramLocators.StoryViewerMediaSelector);
+            var imageCount = await images.CountAsync();
+            for (var i = 0; i < imageCount; i++)
+            {
+                var tag = await images.Nth(i).EvaluateAsync<string>("el => el.tagName.toLowerCase()");
+                if (tag == "video")
+                {
+                    continue;
+                }
+
+                var src = await images.Nth(i).GetAttributeAsync("src");
+                if (string.IsNullOrWhiteSpace(src))
+                {
+                    // Prefer largest candidate from srcset when src is missing.
+                    var srcset = await images.Nth(i).GetAttributeAsync("srcset");
+                    src = PickBestFromSrcSet(srcset);
+                }
+
+                if (string.IsNullOrWhiteSpace(src)
+                    || src.StartsWith("blob:", StringComparison.OrdinalIgnoreCase)
+                    || !LooksLikeCdnMedia(src))
+                {
+                    continue;
+                }
+
+                // Skip tiny UI icons / profile thumbs.
+                if (src.Contains("s150x150", StringComparison.OrdinalIgnoreCase)
+                    || src.Contains("s50x50", StringComparison.OrdinalIgnoreCase)
+                    || src.Contains("s320x320", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                var key = StoryFingerprint.Create(null, username, src, publishedAt: null);
+                results.Add(new InstagramStoryMedia
+                {
+                    StoryId = key,
+                    InstagramStoryId = null,
+                    Username = username,
+                    MediaType = StoryMediaType.Image,
+                    MediaUrl = src,
+                    PublishedAt = null
+                });
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "DOM media extraction failed for {Username}", username);
+        }
+
+        return results;
+    }
+
+    private static string? PickBestFromSrcSet(string? srcset)
+    {
+        if (string.IsNullOrWhiteSpace(srcset))
+        {
+            return null;
+        }
+
+        string? best = null;
+        var bestWidth = -1;
+        foreach (var part in srcset.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries))
+        {
+            var bits = part.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            if (bits.Length == 0)
+            {
+                continue;
+            }
+
+            var url = bits[0];
+            var width = 0;
+            if (bits.Length > 1 && bits[1].EndsWith('w') && int.TryParse(bits[1][..^1], out var parsed))
+            {
+                width = parsed;
+            }
+
+            if (width >= bestWidth)
+            {
+                bestWidth = width;
+                best = url;
+            }
+        }
+
+        return best;
+    }
+
+    private static bool LooksLikeCdnMedia(string url)
+        => url.Contains("cdninstagram", StringComparison.OrdinalIgnoreCase)
+           || url.Contains("fbcdn", StringComparison.OrdinalIgnoreCase)
+           || url.Contains(".mp4", StringComparison.OrdinalIgnoreCase)
+           || url.Contains(".jpg", StringComparison.OrdinalIgnoreCase)
+           || url.Contains(".webp", StringComparison.OrdinalIgnoreCase);
+
     private static bool LooksLikeStoryApiResponse(string url, string contentType)
     {
         if (!url.Contains("instagram.com", StringComparison.OrdinalIgnoreCase)
@@ -240,7 +522,6 @@ public sealed class InstagramStoryDetector : IInstagramStoryDetector
             return false;
         }
 
-        // Ignore static JS bundles; they are not story media payloads.
         if (url.Contains(".js", StringComparison.OrdinalIgnoreCase)
             && !url.Contains("graphql", StringComparison.OrdinalIgnoreCase))
         {
@@ -254,7 +535,8 @@ public sealed class InstagramStoryDetector : IInstagramStoryDetector
             || url.Contains("/stories/", StringComparison.OrdinalIgnoreCase)
             || url.Contains("reel", StringComparison.OrdinalIgnoreCase)
             || url.Contains("feed", StringComparison.OrdinalIgnoreCase)
-            || url.Contains("media", StringComparison.OrdinalIgnoreCase);
+            || url.Contains("media", StringComparison.OrdinalIgnoreCase)
+            || url.Contains("query", StringComparison.OrdinalIgnoreCase);
 
         return isJsonContent || isApiPath;
     }
